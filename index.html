@@ -45,19 +45,11 @@
         import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // --- 初始化配置 ---
-        const firebaseConfig = JSON.parse(__firebase_config);
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'travel-planner-v2';
-        const apiKey = ""; // Gemini API Key
-
         // --- 全域狀態管理 ---
         let state = {
             user: null,
             savedTrips: [],
-            step: 'landing', // landing, setup, hotels, loading, dashboard
+            step: 'loading', // landing, setup, hotels, loading, dashboard, error
             currentTripId: null,
             tripInfo: {
                 destination: '',
@@ -71,12 +63,40 @@
             itinerary: null,
             selectedDay: null,
             selectedEvent: null,
-            loadingMsg: '正在獲取最新資訊...',
+            loadingMsg: '正在啟動應用程式...',
             showAddModal: false,
-            activeDayToAdd: null
+            activeDayToAdd: null,
+            errorMessage: ''
         };
 
-        // --- 核心邏輯 ---
+        // --- 初始化配置 (防崩潰處理) ---
+        let app, auth, db, appId, apiKey;
+
+        async function initializeAppServices() {
+            try {
+                // 檢查變數是否存在，防止在 GitHub Pages 上直接報錯
+                if (typeof __firebase_config === 'undefined') {
+                    throw new Error("找不到 Firebase 配置。這可能是因為您在 Canvas 環境外運行此檔案。");
+                }
+                
+                const firebaseConfig = JSON.parse(__firebase_config);
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                appId = typeof __app_id !== 'undefined' ? __app_id : 'travel-planner-v2';
+                apiKey = ""; // Gemini API Key 由執行環境提供
+
+                await initAuth();
+                setupListeners();
+                state.step = 'landing';
+                render();
+            } catch (err) {
+                console.error("Initialization Error:", err);
+                state.step = 'error';
+                state.errorMessage = err.message;
+                render();
+            }
+        }
 
         async function initAuth() {
             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
@@ -101,7 +121,7 @@
         }
 
         async function saveTripToCloud() {
-            if (!state.user) return;
+            if (!state.user || !db) return;
             const saveTitle = `${state.tripInfo.destination}_${state.tripInfo.purpose}_${state.tripInfo.startDate}至${state.tripInfo.endDate}`;
             const tripId = state.currentTripId || crypto.randomUUID();
             state.currentTripId = tripId;
@@ -127,13 +147,13 @@
             const daysCount = Math.ceil(Math.abs(end - start) / (1000 * 60 * 60 * 24)) + 1;
 
             state.step = 'loading';
-            state.loadingMsg = `正在查詢航班 ${state.tripInfo.flightOut} 的最新狀態...`;
+            state.loadingMsg = `正在根據航班 ${state.tripInfo.flightOut} 編排行程...`;
             render();
 
             const systemPrompt = `你是一位專業的日本旅行規劃師。請根據以下資料生成一個詳細行程 JSON：
             目的地：${state.tripInfo.destination}，天數：${daysCount} 天。
             酒店安排：${state.hotels.map(h => `第${h.night}晚: ${h.isTBD ? '待定' : h.name}`).join(', ')}
-            要求：1. 第一天包含機場降落，最後一天包含回程。2. 不走回頭路。
+            要求：1. 第一天包含機場降落後的行程，最後一天包含前往機場的安排。2. 全程動線順暢不走回頭路。
             輸出格式：{"days": [{"dayNum": 1, "events": [{"time": "HH:MM", "type": "attraction", "title": "名稱", "desc": "簡介", "lat": 0, "lng": 0}]}], "hotelSuggestions": []}`;
 
             try {
@@ -146,13 +166,14 @@
                     })
                 });
                 const data = await response.json();
+                if (!data.candidates) throw new Error("AI 生成失敗");
                 state.itinerary = JSON.parse(data.candidates[0].content.parts[0].text);
                 await saveTripToCloud();
                 state.step = 'dashboard';
                 render();
             } catch (err) {
                 state.step = 'setup';
-                alert("生成失敗，請重試。");
+                state.errorMessage = "AI 行程生成失敗，請稍後重試。";
                 render();
             }
         }
@@ -169,7 +190,25 @@
                 case 'hotels': renderHotels(appDiv); break;
                 case 'loading': renderLoading(appDiv); break;
                 case 'dashboard': renderDashboard(appDiv); break;
+                case 'error': renderError(appDiv); break;
             }
+        }
+
+        function renderError(container) {
+            container.className = "min-h-screen bg-pink-50 p-6 flex flex-col items-center justify-center text-center";
+            container.innerHTML = `
+                <div class="w-full max-w-md bg-white rounded-[40px] shadow-xl p-10 border-4 border-white">
+                    <i class="fa-solid fa-triangle-exclamation text-pink-400 text-6xl mb-6"></i>
+                    <h2 class="text-2xl font-black text-pink-500 mb-4 tracking-tight">Oops! 出錯了</h2>
+                    <p class="text-pink-300 text-sm mb-8 leading-relaxed">${state.errorMessage}</p>
+                    <div class="text-[10px] text-gray-400 mb-6 bg-gray-50 p-4 rounded-2xl text-left font-mono">
+                        提示：此應用程式依賴 Canvas 執行環境。若在 GitHub Pages 運行，請確保已配置 Firebase 變數。
+                    </div>
+                    <button onclick="location.reload()" class="w-full bg-pink-400 text-white font-bold py-4 rounded-3xl shadow-lg active:scale-95 transition-all">
+                        重新整理嘗試
+                    </button>
+                </div>
+            `;
         }
 
         function renderLanding(container) {
@@ -181,19 +220,19 @@
                     </div>
                     <h1 class="text-4xl font-black text-pink-400 mb-2 tracking-tight">旅の達人</h1>
                     <p class="text-pink-300 font-bold mb-10">開始規劃你的專屬可愛旅程吧！🌸</p>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-left">
                         <button id="btn-new-trip" class="group bg-pink-400 text-white p-8 rounded-[35px] shadow-lg hover:bg-pink-500 transition-all flex flex-col items-center gap-4 active:scale-95">
                             <div class="bg-white/20 p-4 rounded-full group-hover:rotate-12 transition-transform">
                                 <i class="fa-solid fa-plus text-3xl"></i>
                             </div>
                             <span class="text-xl font-black">新建旅行準備</span>
                         </button>
-                        <div class="bg-orange-50 p-6 rounded-[35px] border-2 border-orange-100 flex flex-col">
+                        <div class="bg-orange-50 p-6 rounded-[35px] border-2 border-orange-100 flex flex-col h-full">
                             <h3 class="text-orange-400 font-black flex items-center gap-2 mb-4">
                                 <i class="fa-solid fa-clock-rotate-left"></i> 已儲存的行程
                             </h3>
-                            <div class="space-y-3 overflow-y-auto max-h-48 scrollbar-hide px-1" id="saved-trips-list">
-                                ${state.savedTrips.length === 0 ? '<div class="text-xs text-orange-200 font-bold py-10">目前沒有儲存紀錄</div>' : ''}
+                            <div class="space-y-3 overflow-y-auto max-h-48 scrollbar-hide flex-1" id="saved-trips-list">
+                                ${state.savedTrips.length === 0 ? '<div class="text-xs text-orange-200 font-bold py-10 text-center">目前沒有儲存紀錄</div>' : ''}
                             </div>
                         </div>
                     </div>
@@ -229,6 +268,7 @@
                 };
                 item.querySelector('.btn-delete-trip').onclick = async (e) => {
                     e.stopPropagation();
+                    if (!db) return;
                     await deleteDoc(doc(db, 'artifacts', appId, 'users', state.user.uid, 'trips', trip.id));
                 };
                 list.appendChild(item);
@@ -240,27 +280,27 @@
             container.innerHTML = `
                 <div class="w-full max-w-md bg-white rounded-[40px] shadow-xl p-8 border-4 border-white relative">
                     <button id="back-to-landing" class="text-pink-300 flex items-center gap-1 mb-4 text-xs font-bold hover:text-pink-400">
-                        <i class="fa-solid fa-xmark"></i> 返回
+                        <i class="fa-solid fa-xmark"></i> 返回首頁
                     </button>
                     <h1 class="text-3xl font-black text-pink-400 text-center mb-6 tracking-tight">旅の準備</h1>
                     
                     <div class="space-y-4">
                         <div>
                             <label class="block text-pink-500 font-bold mb-1 text-sm"><i class="fa-solid fa-location-dot"></i> 目的地</label>
-                            <input id="input-dest" value="${state.tripInfo.destination}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm" placeholder="東京、京都...">
+                            <input id="input-dest" value="${state.tripInfo.destination}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm" placeholder="例如：東京">
                         </div>
                         <div>
                             <label class="block text-pink-500 font-bold mb-1 text-sm"><i class="fa-solid fa-pen-to-square"></i> 旅行目的</label>
-                            <input id="input-purpose" value="${state.tripInfo.purpose}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm" placeholder="購物與美食之旅">
+                            <input id="input-purpose" value="${state.tripInfo.purpose}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm" placeholder="美食與購物">
                         </div>
                         <div class="grid grid-cols-2 gap-4">
                             <div>
-                                <label class="block text-pink-500 font-bold mb-1 text-sm"><i class="fa-solid fa-calendar"></i> 出發</label>
+                                <label class="block text-pink-500 font-bold mb-1 text-sm"><i class="fa-solid fa-calendar"></i> 出發日期</label>
                                 <input type="date" id="input-start" value="${state.tripInfo.startDate}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm">
                             </div>
                             <div>
-                                <label class="block text-pink-500 font-bold mb-1 text-sm"><i class="fa-solid fa-calendar-check"></i> 回程</label>
-                                <input type="date" id="input-end" value="${state.tripInfo.endDate}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm">
+                                <label class="block text-pink-500 font-bold mb-1 text-sm"><i class="fa-solid fa-calendar-check"></i> 回程日期</label>
+                                <input type="date" id="input-end" value="${state.tripInfo.endDate}" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none focus:border-pink-300 text-sm" min="${state.tripInfo.startDate}">
                             </div>
                         </div>
                         <div class="grid grid-cols-2 gap-4">
@@ -293,7 +333,9 @@
                 const count = Math.ceil(Math.abs(end - start) / (1000 * 60 * 60 * 24)) + 1;
                 
                 if (isNaN(count) || count < 1) {
-                    alert("請選擇正確日期");
+                    state.step = 'setup';
+                    state.errorMessage = "請填寫正確的出發與回程日期。";
+                    render();
                     return;
                 }
                 
@@ -310,7 +352,7 @@
                     <h2 class="text-2xl font-black text-pink-500 mb-6 flex items-center gap-2"><i class="fa-solid fa-hotel"></i> 住宿安排</h2>
                     <div class="space-y-4 max-h-[60vh] overflow-y-auto px-1 scrollbar-hide" id="hotels-list"></div>
                     <div class="flex gap-4 mt-8">
-                        <button id="hotel-back" class="flex-1 bg-white text-pink-400 font-bold py-4 rounded-3xl border-2 border-pink-400">返回</button>
+                        <button id="hotel-back" class="flex-1 bg-white text-pink-400 font-bold py-4 rounded-3xl border-2 border-pink-400">返回修改</button>
                         <button id="hotel-generate" class="flex-[2] bg-pink-400 text-white font-bold py-4 px-8 rounded-3xl shadow-lg">生成 AI 行程 🪄</button>
                     </div>
                 </div>
@@ -324,16 +366,16 @@
                     <div class="flex justify-between items-center mb-3">
                         <span class="font-bold text-gray-600">第 ${hotel.night} 晚住宿</span>
                         <label class="flex items-center gap-2 text-sm font-bold text-pink-400 cursor-pointer bg-pink-50 px-3 py-1 rounded-full">
-                            <input type="checkbox" class="hotel-tbd-check" ${hotel.isTBD ? 'checked' : ''} class="accent-pink-400"> 待定
+                            <input type="checkbox" class="hotel-tbd-check" ${hotel.isTBD ? 'checked' : ''}> 待定
                         </label>
                     </div>
                     <input type="text" class="hotel-name-input w-full p-4 rounded-2xl bg-gray-50 border-none outline-none focus:ring-2 ring-pink-200 text-sm" 
-                           placeholder="酒店名稱" value="${hotel.name}" ${hotel.isTBD ? 'disabled' : ''}>
+                           placeholder="酒店名稱或地區" value="${hotel.name}" ${hotel.isTBD ? 'disabled' : ''}>
                 `;
                 item.querySelector('.hotel-tbd-check').onchange = (e) => {
                     state.hotels[idx].isTBD = e.target.checked;
                     if (e.target.checked) state.hotels[idx].name = '';
-                    render();
+                    renderHotels(container); // 局部重新渲染列表狀態
                 };
                 item.querySelector('.hotel-name-input').oninput = (e) => {
                     state.hotels[idx].name = e.target.value;
@@ -350,16 +392,16 @@
             container.innerHTML = `
                 <i class="fa-solid fa-plane-up text-pink-300 text-7xl animate-bounce-slow mb-6"></i>
                 <h2 class="text-2xl font-black text-pink-500 animate-bounce tracking-tight">${state.loadingMsg}</h2>
-                <p class="text-pink-300 mt-2 font-bold italic">正在為您編排最順路的夢幻行程...</p>
+                <p class="text-pink-300 mt-2 font-bold italic">這可能需要幾秒鐘時間...</p>
             `;
         }
 
         function renderDashboard(container) {
-            container.className = "flex-1 flex flex-col lg:flex-row overflow-hidden";
+            container.className = "flex-1 flex flex-col lg:flex-row overflow-hidden font-['Varela_Round',sans-serif]";
             
             // 地圖 URL 計算
             let mapQuery = state.tripInfo.destination;
-            let displayMode = "全境概覽圖";
+            let displayMode = "目的地全覽";
             
             if (state.selectedEvent) {
                 mapQuery = `${state.selectedEvent.title}, ${state.tripInfo.destination}`;
@@ -373,12 +415,11 @@
                         const destination = encodeURIComponent(`${spots[spots.length - 1]}, ${state.tripInfo.destination}`);
                         const waypoints = spots.slice(1, -1).map(p => encodeURIComponent(`${p}, ${state.tripInfo.destination}`)).join('+to:');
                         mapQuery = `saddr=${origin}&daddr=${waypoints ? waypoints + '+to:' + destination : destination}`;
-                        displayMode = `Day ${state.selectedDay} 完整路線`;
+                        displayMode = `Day ${state.selectedDay} 路線預覽`;
                     } else {
                         mapQuery = `q=${encodeURIComponent(`${spots[0] || state.tripInfo.destination}`)}`;
                     }
                 }
-                displayMode = `Day ${state.selectedDay} 路線預覽`;
             } else {
                 mapQuery = `q=${encodeURIComponent(state.tripInfo.destination)}`;
             }
@@ -388,18 +429,18 @@
                 : `https://maps.google.com/maps?q=${mapQuery}&t=&z=14&ie=UTF8&iwloc=&output=embed`;
 
             container.innerHTML = `
-                <!-- 左側列表 -->
-                <div class="flex-1 overflow-y-auto p-4 lg:p-8 space-y-6 scrollbar-hide relative bg-pink-50">
+                <!-- 左側行程列表 -->
+                <div class="flex-1 overflow-y-auto p-4 lg:p-8 space-y-6 scrollbar-hide bg-pink-50 relative">
                     <header class="flex justify-between items-center mb-8">
-                        <div>
-                            <div class="flex items-center gap-4">
-                                <button id="btn-exit" class="p-2 bg-white rounded-full text-pink-400 shadow-sm hover:bg-pink-50"><i class="fa-solid fa-xmark"></i></button>
+                        <div class="flex items-center gap-4">
+                            <button id="btn-exit" class="p-2 bg-white rounded-full text-pink-400 shadow-sm hover:bg-pink-50"><i class="fa-solid fa-arrow-left"></i></button>
+                            <div>
                                 <h1 class="text-4xl font-black text-pink-500 tracking-tight">${state.tripInfo.destination}</h1>
+                                <p class="text-[10px] font-bold text-pink-300 mt-1 uppercase tracking-widest">${state.tripInfo.startDate} ~ ${state.tripInfo.endDate}</p>
                             </div>
-                            <p class="text-xs font-bold text-pink-300 mt-2 ml-14 uppercase">${state.tripInfo.startDate} ~ ${state.tripInfo.endDate}</p>
                         </div>
                         <div class="bg-white p-4 rounded-[25px] shadow-sm flex items-center gap-4 border border-pink-100">
-                            <i class="fa-solid fa-sun text-yellow-400 text-2xl"></i>
+                            <i class="fa-solid fa-cloud-sun text-yellow-400 text-2xl"></i>
                             <div class="text-2xl font-black text-gray-700">22°C</div>
                         </div>
                     </header>
@@ -407,42 +448,40 @@
                     <div id="itinerary-days" class="space-y-12 pb-20"></div>
                 </div>
 
-                <!-- 右側地圖 -->
-                <div class="w-full lg:w-[480px] bg-white border-l-4 border-pink-100 flex flex-col relative h-[50vh] lg:h-full shadow-2xl">
+                <!-- 右側互動地圖 -->
+                <div class="w-full lg:w-[480px] bg-white border-l-4 border-pink-100 flex flex-col h-[50vh] lg:h-full shadow-2xl relative">
                     <div class="p-6 bg-pink-400 text-white flex justify-between items-center shadow-lg z-20">
                         <span class="font-black text-lg flex items-center gap-2 truncate pr-2">
-                            <i class="fa-solid fa-location-arrow ${state.selectedDay || state.selectedEvent ? 'animate-bounce' : ''}"></i> 
+                            <i class="fa-solid fa-location-crosshairs ${state.selectedDay || state.selectedEvent ? 'animate-bounce' : ''}"></i> 
                             ${displayMode}
                         </span>
                         ${(state.selectedDay || state.selectedEvent) ? `
-                            <button id="btn-reset-map" class="bg-white/30 px-4 py-2 rounded-2xl text-xs font-black hover:bg-white/40 whitespace-nowrap">恢復全覽</button>
+                            <button id="btn-reset-map" class="bg-white/30 px-4 py-2 rounded-2xl text-xs font-black hover:bg-white/40 whitespace-nowrap">重置視角</button>
                         ` : ''}
                     </div>
                     <div class="flex-1 bg-gray-100 relative">
-                        <iframe width="100%" height="100%" style="border:0" loading="lazy" src="${finalMapUrl}"></iframe>
+                        <iframe width="100%" height="100%" style="border:0" loading="lazy" src="${finalMapUrl}" title="Google Maps"></iframe>
                         <div class="absolute top-4 left-4 right-4 bg-white/70 backdrop-blur-md p-3 rounded-2xl shadow-sm border border-white/50 pointer-events-none">
-                            <p class="text-[10px] text-gray-600 font-black uppercase text-center tracking-widest">
-                                ${state.selectedDay ? '📍 正在顯示該日導航路線' : '🗺️ 點擊行程標題或地點查看路線'}
+                            <p class="text-[9px] text-gray-600 font-black uppercase text-center tracking-widest">
+                                ${state.selectedDay ? '📍 導航路線已啟用' : '🗺️ 點擊標題開啟單日動線'}
                             </p>
                         </div>
                     </div>
                     
-                    ${state.itinerary.hotelSuggestions ? `
+                    ${state.itinerary.hotelSuggestions && state.itinerary.hotelSuggestions.length > 0 ? `
                         <div class="p-4 bg-indigo-50/95 backdrop-blur-sm border-t border-indigo-100 h-40 overflow-y-auto scrollbar-hide">
-                            <h4 class="text-[10px] font-black text-indigo-400 uppercase mb-3 flex items-center gap-2">住宿推薦</h4>
+                            <h4 class="text-[10px] font-black text-indigo-400 uppercase mb-3 flex items-center gap-2 tracking-widest">動線優化住宿建議</h4>
                             <div class="space-y-3" id="hotel-suggestions"></div>
                         </div>
                     ` : ''}
                 </div>
             `;
 
-            // 綁定基礎按鈕
             document.getElementById('btn-exit').onclick = () => { state.step = 'landing'; render(); };
             if (document.getElementById('btn-reset-map')) {
                 document.getElementById('btn-reset-map').onclick = () => { state.selectedDay = null; state.selectedEvent = null; render(); };
             }
 
-            // 渲染每日行程
             const daysContainer = document.getElementById('itinerary-days');
             state.itinerary.days.forEach((day, dIdx) => {
                 const dayWrapper = document.createElement('div');
@@ -454,9 +493,9 @@
                             ${day.dayNum}
                         </div>
                         <div>
-                            <h3 class="text-xl font-black text-gray-700 group-hover:text-pink-400">Day ${day.dayNum} 行程</h3>
-                            <p class="text-[10px] font-bold uppercase ${state.selectedDay === day.dayNum ? 'text-pink-400' : 'text-pink-200'}">
-                                ${state.selectedDay === day.dayNum ? '● 正在查看單日路線' : '○ 點擊查看路線圖'}
+                            <h3 class="text-xl font-black text-gray-700 group-hover:text-pink-400 transition-colors">Day ${day.dayNum} 行程</h3>
+                            <p class="text-[10px] font-bold uppercase tracking-widest ${state.selectedDay === day.dayNum ? 'text-pink-400' : 'text-pink-200'}">
+                                ${state.selectedDay === day.dayNum ? '● 正在查看單日動線' : '○ 點擊查看今日路線圖'}
                             </p>
                         </div>
                     </div>
@@ -477,18 +516,18 @@
                         <div class="absolute -left-[45px] top-6 w-6 h-6 bg-white border-4 border-pink-300 rounded-full z-10"></div>
                         <div class="flex justify-between items-start mb-2">
                             <div class="flex items-center gap-3">
-                                <div class="p-2 rounded-xl ${event.type === 'meal' ? 'bg-orange-50 text-orange-400' : 'bg-pink-50 text-pink-400'}">
-                                    <i class="fa-solid ${event.type === 'meal' ? 'fa-utensils' : (event.type === 'flight' ? 'fa-plane' : 'fa-map-pin')} text-lg"></i>
+                                <div class="p-2 rounded-xl ${event.type === 'meal' ? 'bg-orange-50 text-orange-400' : (event.type === 'flight' ? 'bg-blue-50 text-blue-400' : 'bg-pink-50 text-pink-400')}">
+                                    <i class="fa-solid ${event.type === 'meal' ? 'fa-utensils' : (event.type === 'flight' ? 'fa-plane' : 'fa-map-pin')}"></i>
                                 </div>
                                 <div>
                                     <span class="font-black text-gray-700 text-lg">${event.title}</span>
                                     <span class="ml-2 text-[10px] font-bold bg-gray-100 text-gray-400 px-2 py-0.5 rounded-full">${event.time}</span>
                                 </div>
                             </div>
-                            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100">
-                                <button class="btn-move-up p-1 hover:text-pink-400"><i class="fa-solid fa-chevron-up"></i></button>
-                                <button class="btn-move-down p-1 hover:text-pink-400"><i class="fa-solid fa-chevron-down"></i></button>
-                                <button class="btn-del-event p-1 hover:text-red-400"><i class="fa-solid fa-trash-can"></i></button>
+                            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button class="btn-move-up p-1 hover:text-pink-400 transition-colors"><i class="fa-solid fa-chevron-up"></i></button>
+                                <button class="btn-move-down p-1 hover:text-pink-400 transition-colors"><i class="fa-solid fa-chevron-down"></i></button>
+                                <button class="btn-del-event p-1 hover:text-red-400 transition-colors"><i class="fa-solid fa-trash-can"></i></button>
                             </div>
                         </div>
                         <p class="text-sm text-gray-500 leading-relaxed">${event.desc}</p>
@@ -500,7 +539,6 @@
                         render();
                     };
 
-                    // 綁定編輯功能
                     eventCard.querySelector('.btn-move-up').onclick = (e) => {
                         e.stopPropagation();
                         if (eIdx > 0) {
@@ -524,26 +562,23 @@
                     eventsContainer.appendChild(eventCard);
                 });
 
-                // 新增按鈕
                 const addBtn = document.createElement('button');
-                addBtn.className = "flex items-center gap-2 text-pink-400 font-black text-sm hover:translate-x-1 transition-transform bg-white/80 px-4 py-3 rounded-full border border-pink-100 shadow-sm";
-                addBtn.innerHTML = `<i class="fa-solid fa-plus"></i> 新增景點`;
+                addBtn.className = "flex items-center gap-2 text-pink-400 font-black text-xs hover:translate-x-1 transition-transform bg-white/80 px-4 py-3 rounded-full border border-pink-100 shadow-sm";
+                addBtn.innerHTML = `<i class="fa-solid fa-plus"></i> 新增景點或餐廳`;
                 addBtn.onclick = () => {
                     state.activeDayToAdd = dIdx;
                     state.showAddModal = true;
                     render();
                 };
                 eventsContainer.appendChild(addBtn);
-
                 daysContainer.appendChild(dayWrapper);
             });
 
-            // 渲染住宿建議
             const hotelSugg = document.getElementById('hotel-suggestions');
-            if (hotelSugg) {
+            if (hotelSugg && state.itinerary.hotelSuggestions) {
                 state.itinerary.hotelSuggestions.forEach(h => {
                     const hCard = document.createElement('div');
-                    hCard.className = "bg-white p-4 rounded-3xl text-[10px] font-bold text-indigo-600 shadow-sm border border-indigo-100";
+                    hCard.className = "bg-white p-4 rounded-3xl text-[10px] font-bold text-indigo-600 shadow-sm border border-indigo-100 hover:border-indigo-300 transition-colors";
                     hCard.innerHTML = `
                         <div class="flex justify-between items-center mb-1">
                             <span class="font-black text-indigo-500 text-xs">🏨 ${h.recommendations || h}</span>
@@ -555,7 +590,6 @@
                 });
             }
 
-            // 如果有彈窗
             if (state.showAddModal) renderModal(container);
         }
 
@@ -564,15 +598,15 @@
             modal.className = "fixed inset-0 bg-pink-400/20 backdrop-blur-md z-50 flex items-center justify-center p-6";
             modal.innerHTML = `
                 <div class="bg-white w-full max-w-sm rounded-[50px] p-10 shadow-2xl border-4 border-white">
-                    <h3 class="text-2xl font-black text-pink-400 mb-6 flex items-center gap-2">新增行程 ✨</h3>
+                    <h3 class="text-2xl font-black text-pink-400 mb-6 flex items-center gap-2"><i class="fa-solid fa-magic-wand-sparkles"></i> 新增行程</h3>
                     <div class="space-y-4">
-                        <input id="modal-title" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none text-sm" placeholder="景點名稱">
-                        <input id="modal-time" type="time" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none text-sm" value="12:00">
-                        <textarea id="modal-desc" class="w-full p-3 rounded-2xl border-2 border-pink-100 outline-none text-sm h-24" placeholder="簡介..."></textarea>
+                        <input id="modal-title" class="w-full p-4 rounded-2xl bg-gray-50 border-none outline-none focus:ring-2 ring-pink-100 text-sm" placeholder="景點或餐廳名稱">
+                        <input id="modal-time" type="time" class="w-full p-4 rounded-2xl bg-gray-50 border-none outline-none focus:ring-2 ring-pink-100 text-sm" value="12:00">
+                        <textarea id="modal-desc" class="w-full p-4 rounded-2xl bg-gray-50 border-none outline-none focus:ring-2 ring-pink-100 text-sm h-24" placeholder="行程備註..."></textarea>
                     </div>
                     <div class="flex gap-4 mt-8">
-                        <button id="modal-cancel" class="flex-1 bg-gray-100 text-gray-400 font-bold py-4 rounded-3xl">取消</button>
-                        <button id="modal-save" class="flex-1 bg-pink-400 text-white font-bold py-4 rounded-3xl shadow-lg">添加</button>
+                        <button id="modal-cancel" class="flex-1 bg-gray-100 text-gray-400 font-bold py-4 rounded-3xl transition-all hover:bg-gray-200">取消</button>
+                        <button id="modal-save" class="flex-1 bg-pink-400 text-white font-bold py-4 rounded-3xl shadow-lg active:scale-95 transition-all">確認添加 ✨</button>
                     </div>
                 </div>
             `;
@@ -593,11 +627,7 @@
         }
 
         // --- 啟動程序 ---
-        window.onload = async () => {
-            await initAuth();
-            setupListeners();
-            render();
-        };
+        window.onload = initializeAppServices;
 
     </script>
 </body>
